@@ -27,11 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-# Import shared TurboQuant hooks from quantization module
-from sglang.srt.layers.quantization.turboquant import (
-    apply_turboquant_kv_cache,
-    is_turboquant_layer,
-)
+# TurboQuant compression is handled by TokenToKVPool.set_kv_buffer.
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -826,24 +822,21 @@ class TritonAttnBackend(AttentionBackend):
 
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
-            k_store, v_store = k, v
-            if is_turboquant_layer(layer):
-                k_store, v_store = apply_turboquant_kv_cache(layer, k, v)
             if (
                 self.use_mla or layer.k_scale is None
             ):  # Triton MLA currently doesn't support quantized kv cache
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
-                    k_store,
-                    v_store,
+                    k,
+                    v,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
-                    k_store.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                    v_store.clone(),
+                    k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
+                    v.clone(),
                     layer.k_scale,
                     layer.v_scale,
                 )
@@ -1066,22 +1059,19 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
-            k_store, v_store = k, v
-            if is_turboquant_layer(layer):
-                k_store, v_store = apply_turboquant_kv_cache(layer, k, v)
             if self.use_mla:  # Triton MLA currently doesn't support quantized kv cache
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
-                    k_store,
-                    v_store,
+                    k,
+                    v,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
-                    k_store,
-                    v_store,
+                    k,
+                    v,
                     layer.k_scale,
                     layer.v_scale,
                 )

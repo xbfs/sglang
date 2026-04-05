@@ -578,71 +578,13 @@ def is_turboquant_layer(layer) -> bool:
 
 
 def apply_turboquant_kv_cache(layer, k: torch.Tensor, v: torch.Tensor):
-    """Apply TurboQuant encode→decode round-trip to K/V before storing to cache.
-    
-    On the first call (not yet calibrated), runs calibration on the current batch.
-    Returns the round-tripped (lossy-compressed) K and V tensors in fp16,
-    ready to be stored into the paged KV cache.
+    """Deprecated old path.
 
-    NOTE: This function uses boolean indexing which is incompatible with CUDA graph
-    capture. It skips quantization during CUDA graph capture and only applies during
-    normal (non-captured) inference. Calibration is also skipped during capture.
+    TurboQuant now only supports compressed KV storage through
+    ``MHATokenToKVPoolTurboQuant.set_kv_buffer``. The previous round-trip
+    encode->decode path is removed to avoid silently bypassing compressed storage.
     """
-    # Skip during CUDA graph capture — boolean indexing is not capturable
-    try:
-        from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-        if is_in_piecewise_cuda_graph():
-            return k, v
-    except ImportError:
-        pass
-
-    # Check if we're inside a CUDA graph capture context via torch
-    if torch.cuda.is_current_stream_capturing():
-        return k, v
-
-    # Lazy calibration on first forward pass
-    if not getattr(layer, "tq_calibrated", False):
-        # Reshape to (tokens, heads, head_dim) for calibration
-        k_cal = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-        v_cal = v.view(-1, layer.tp_v_head_num, layer.head_dim)
-        calibrate(
-            layer,
-            k_cal,
-            v_cal,
-            bits=layer.tq_config.polar_bits,
-            outlier_fraction=layer.tq_config.outlier_fraction,
-        )
-    
-    # Move TQ params to the correct device if needed
-    device = k.device
-    if layer.tq_R.device != device:
-        layer.tq_R = layer.tq_R.to(device)
-        layer.tq_R_T = layer.tq_R_T.to(device)
-        layer.tq_outlier_mask = layer.tq_outlier_mask.to(device)
-        layer.tq_codebook_k = layer.tq_codebook_k.to(device)
-        layer.tq_codebook_v = layer.tq_codebook_v.to(device)
-    
-    # Reshape to (..., head_dim) for encode/decode
-    orig_k_shape = k.shape
-    orig_v_shape = v.shape
-    k_3d = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-    v_3d = v.view(-1, layer.tp_v_head_num, layer.head_dim)
-    
-    # Encode (quantize) then immediately decode (dequantize)
-    encoded = turboquant_encode_v2(
-        k_3d,
-        v_3d,
-        layer.tq_R,
-        layer.tq_codebook_k,
-        layer.tq_codebook_v,
-        layer.tq_outlier_mask,
-        bits=layer.tq_config.polar_bits,
-        use_qjl=layer.tq_config.use_qjl,
+    raise RuntimeError(
+        "apply_turboquant_kv_cache is removed. "
+        "Use the compressed TurboQuant KV pool path via token_to_kv_pool.set_kv_buffer."
     )
-    k_out, v_out = turboquant_decode_v2(
-        encoded,
-        layer.tq_R_T,
-        use_qjl=layer.tq_config.use_qjl,
-    )
-    
-    return k_out.reshape(orig_k_shape), v_out.reshape(orig_v_shape)
