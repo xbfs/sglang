@@ -185,11 +185,18 @@ def calibrate_channels(
         outlier_mask: [head_dim] bool — True for outlier channels.
         variance: [head_dim] per-channel variance.
     """
-    flat = k_samples.reshape(-1, k_samples.shape[-1]).float()
+    head_dim = k_samples.shape[-1]
+    flat = k_samples.reshape(-1, head_dim).float()
     variance = flat.var(dim=0)
-    n_outliers = max(1, int(outlier_fraction * k_samples.shape[-1]))
-    threshold = variance.topk(n_outliers).values[-1]
-    outlier_mask = variance >= threshold
+
+    # Keep at least one normal channel so quantized path never has zero width.
+    n_outliers = int(outlier_fraction * head_dim)
+    n_outliers = max(0, min(n_outliers, head_dim - 1))
+
+    outlier_mask = torch.zeros(head_dim, dtype=torch.bool, device=variance.device)
+    if n_outliers > 0:
+        outlier_idx = variance.topk(n_outliers).indices
+        outlier_mask[outlier_idx] = True
     return outlier_mask, variance
 
 

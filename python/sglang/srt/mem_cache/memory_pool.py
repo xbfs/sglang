@@ -1216,6 +1216,471 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
+    """TurboQuant KV cache pool with compressed storage and fused decode."""
+
+    is_turboquant_compressed_pool = True
+    requires_local_kv_indices = True
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = False,
+        enable_kv_cache_copy: bool = False,
+        tq_bits: int = 4,
+        tq_outlier_fraction: float = 0.10,
+        tq_use_qjl: bool = False,
+    ):
+        self._default_outlier_fraction = tq_outlier_fraction
+        self._default_bits = tq_bits
+        self._default_use_qjl = tq_use_qjl
+        self._active_kv_indices: Optional[torch.Tensor] = None
+        self._active_version = 0
+        self._last_layer_id = -1
+        self._last_active_version = -1
+        self._last_decode_count = -1
+        self._last_full_mode = False
+        self._head_index_offsets = torch.arange(head_num, dtype=torch.long, device=device)
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            v_head_dim=v_head_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+        )
+        self._k_workspace = torch.empty((0, self.head_num, self.head_dim), dtype=self.dtype, device=self.device)
+        self._v_workspace = torch.empty_like(self._k_workspace)
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = self.head_num
+                outlier_dim = int(self.head_dim * self._default_outlier_fraction)
+                outlier_dim = max(0, min(outlier_dim, self.head_dim - 1))
+                normal_dim = self.head_dim - outlier_dim
+                n_levels = 2 ** self._default_bits
+                packed_dim = (normal_dim + 1) // 2
+                self.k_codes_buffer = [
+                    torch.zeros((m, n, packed_dim), dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_codes_buffer = [
+                    torch.zeros((m, n, packed_dim), dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.k_scale_buffer = [
+                    torch.zeros((m, n, 1), dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.zeros((m, n, 1), dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.k_outlier_buffer = [
+                    torch.zeros((m, n, outlier_dim), dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_outlier_buffer = [
+                    torch.zeros((m, n, outlier_dim), dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                if self._default_use_qjl:
+                    self.k_qjl_bits_buffer = [
+                        torch.zeros((m, n, normal_dim), dtype=torch.uint8, device=self.device)
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_qjl_bits_buffer = [
+                        torch.zeros((m, n, normal_dim), dtype=torch.uint8, device=self.device)
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_qjl_norm_buffer = [
+                        torch.zeros((m, n, 1), dtype=torch.float16, device=self.device)
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_qjl_norm_buffer = [
+                        torch.zeros((m, n, 1), dtype=torch.float16, device=self.device)
+                        for _ in range(self.layer_num)
+                    ]
+                else:
+                    self.k_qjl_bits_buffer = [None for _ in range(self.layer_num)]
+                    self.v_qjl_bits_buffer = [None for _ in range(self.layer_num)]
+                    self.k_qjl_norm_buffer = [None for _ in range(self.layer_num)]
+                    self.v_qjl_norm_buffer = [None for _ in range(self.layer_num)]
+                self.layer_outlier_dim = [outlier_dim for _ in range(self.layer_num)]
+                self.layer_normal_dim = [normal_dim for _ in range(self.layer_num)]
+                self.layer_num_levels = [n_levels for _ in range(self.layer_num)]
+                self.layer_use_qjl = [self._default_use_qjl for _ in range(self.layer_num)]
+                self.layer_ref = [None for _ in range(self.layer_num)]
+                self.layer_write_version = [0 for _ in range(self.layer_num)]
+                self.total_slots = m
+                self.n_heads = n
+                logger.info(
+                    "TurboQuant compressed KV buffers preallocated: "
+                    f"slots={m}, heads={n}, head_dim={self.head_dim}, "
+                    f"normal_dim={normal_dim}, outlier_dim={outlier_dim}, "
+                    f"layers={self.layer_num}, bits={self._default_bits}, "
+                    f"qjl_buffers={'enabled' if self._default_use_qjl else 'disabled'}"
+                )
+
+    def _clear_buffers(self):
+        del self.k_codes_buffer
+        del self.v_codes_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+        del self.k_outlier_buffer
+        del self.v_outlier_buffer
+        del self.k_qjl_bits_buffer
+        del self.v_qjl_bits_buffer
+        del self.k_qjl_norm_buffer
+        del self.v_qjl_norm_buffer
+        del self.layer_outlier_dim
+        del self.layer_normal_dim
+        del self.layer_num_levels
+        del self.layer_use_qjl
+        del self.layer_ref
+        del self.layer_write_version
+
+    def set_active_kv_indices(self, kv_indices: torch.Tensor):
+        self._active_kv_indices = kv_indices.to(device=self.device, dtype=torch.long)
+        self._active_version += 1
+
+    def clear_active_kv_indices(self):
+        self._active_kv_indices = None
+        self._active_version += 1
+
+    def _ensure_workspace(self, n_tokens: int):
+        if self._k_workspace.shape[0] >= n_tokens:
+            return
+        self._k_workspace = torch.empty(
+            (n_tokens, self.head_num, self.head_dim), dtype=self.dtype, device=self.device
+        )
+        self._v_workspace = torch.empty_like(self._k_workspace)
+
+    def _ensure_layer_initialized(
+        self,
+        layer_id: int,
+        layer: RadixAttention,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        from sglang.srt.layers.quantization.turboquant import calibrate
+
+        idx = layer_id - self.start_layer
+        if not getattr(layer, "tq_calibrated", False):
+            calibrate(
+                layer,
+                cache_k.view(-1, self.head_num, self.head_dim),
+                cache_v.view(-1, self.head_num, self.head_dim),
+                bits=layer.tq_config.polar_bits,
+                outlier_fraction=layer.tq_config.outlier_fraction,
+            )
+
+        if layer.tq_R.device != cache_k.device:
+            layer.tq_R = layer.tq_R.to(cache_k.device)
+            layer.tq_R_T = layer.tq_R_T.to(cache_k.device)
+            layer.tq_outlier_mask = layer.tq_outlier_mask.to(cache_k.device)
+            layer.tq_codebook_k = layer.tq_codebook_k.to(cache_k.device)
+            layer.tq_codebook_v = layer.tq_codebook_v.to(cache_k.device)
+
+        self.layer_ref[idx] = layer
+
+        outlier_dim = int(layer.tq_outlier_mask.sum().item())
+        normal_dim = self.head_dim - outlier_dim
+        n_levels = 2 ** layer.tq_config.polar_bits
+        use_qjl = bool(self._default_use_qjl and getattr(layer.tq_config, "use_qjl", False))
+        if n_levels > 16:
+            raise RuntimeError(
+                f"TurboQuant packed4 storage only supports <=4 bits, got n_levels={n_levels}."
+            )
+
+        self.layer_outlier_dim[idx] = outlier_dim
+        self.layer_normal_dim[idx] = normal_dim
+        self.layer_num_levels[idx] = n_levels
+        self.layer_use_qjl[idx] = use_qjl
+        if (
+            self.k_codes_buffer[idx].shape[-1] != (normal_dim + 1) // 2
+            or self.k_outlier_buffer[idx].shape[-1] != outlier_dim
+        ):
+            raise RuntimeError(
+                "TurboQuant preallocated buffer shape mismatch. "
+                f"expected packed_normal={(self.k_codes_buffer[idx].shape[-1])}, outlier={self.k_outlier_buffer[idx].shape[-1]}, "
+                f"got normal={normal_dim}, outlier={outlier_dim}. "
+                "Please keep a consistent outlier_fraction across layers."
+            )
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        from sglang.srt.layers.quantization.turboquant import (
+            HAS_TRITON_KERNELS,
+            turboquant_encode_triton,
+            turboquant_encode_v2,
+        )
+
+        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
+        idx = layer_id - self.start_layer
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        self._ensure_layer_initialized(layer_id, layer, cache_k, cache_v)
+        k_3d = cache_k.view(-1, self.head_num, self.head_dim)
+        v_3d = cache_v.view(-1, self.head_num, self.head_dim)
+        if HAS_TRITON_KERNELS:
+            encoded = turboquant_encode_triton(
+                k_3d,
+                v_3d,
+                layer.tq_R,
+                layer.tq_codebook_k,
+                layer.tq_codebook_v,
+                layer.tq_outlier_mask,
+                bits=layer.tq_config.polar_bits,
+                use_qjl=self.layer_use_qjl[idx],
+            )
+        else:
+            encoded = turboquant_encode_v2(
+                k_3d,
+                v_3d,
+                layer.tq_R,
+                layer.tq_codebook_k,
+                layer.tq_codebook_v,
+                layer.tq_outlier_mask,
+                bits=layer.tq_config.polar_bits,
+                use_qjl=self.layer_use_qjl[idx],
+            )
+
+        loc = loc.to(dtype=torch.long, device=self.device)
+        self.k_codes_buffer[idx][loc] = self._pack_4bit(encoded["k_codes"])
+        self.v_codes_buffer[idx][loc] = self._pack_4bit(encoded["v_codes"])
+        self.k_scale_buffer[idx][loc] = encoded["k_scale"]
+        self.v_scale_buffer[idx][loc] = encoded["v_scale"]
+        self.k_outlier_buffer[idx][loc] = encoded["k_outliers"]
+        self.v_outlier_buffer[idx][loc] = encoded["v_outliers"]
+        if self.layer_use_qjl[idx]:
+            self.k_qjl_bits_buffer[idx][loc] = encoded["k_qjl_bits"]
+            self.v_qjl_bits_buffer[idx][loc] = encoded["v_qjl_bits"]
+            self.k_qjl_norm_buffer[idx][loc] = encoded["k_qjl_norm"]
+            self.v_qjl_norm_buffer[idx][loc] = encoded["v_qjl_norm"]
+        self.layer_write_version[idx] += 1
+
+    @staticmethod
+    def _pack_4bit(codes: torch.Tensor) -> torch.Tensor:
+        d = codes.shape[-1]
+        if d % 2 == 1:
+            pad = torch.zeros((*codes.shape[:-1], 1), dtype=torch.uint8, device=codes.device)
+            codes = torch.cat([codes, pad], dim=-1)
+        lo = codes[..., 0::2] & 0x0F
+        hi = (codes[..., 1::2] & 0x0F) << 4
+        return (lo | hi).contiguous()
+
+    def _decode_selected(self, layer_id: int, token_indices: torch.Tensor):
+        from sglang.srt.layers.quantization.turboquant_kernels import (
+            turboquant_decode_selected_packed4_triton,
+        )
+
+        idx = layer_id - self.start_layer
+        layer = self.layer_ref[idx]
+        if layer is None:
+            raise RuntimeError(f"TurboQuant layer is not initialized for layer {layer_id}")
+
+        n_tokens = int(token_indices.numel())
+        self._ensure_workspace(n_tokens)
+        outlier_dim = self.layer_outlier_dim[idx]
+        normal_dim = self.layer_normal_dim[idx]
+        n_levels = self.layer_num_levels[idx]
+        if outlier_dim is None or normal_dim is None or n_levels is None:
+            raise RuntimeError(f"TurboQuant buffer metadata missing for layer {layer_id}")
+
+        row_indices = (
+            token_indices[:, None] * self.head_num + self._head_index_offsets[None, :]
+        ).reshape(-1).contiguous()
+        total_rows = self.total_slots * self.head_num
+        outlier_shape = (total_rows, outlier_dim)
+
+        k_flat = turboquant_decode_selected_packed4_triton(
+            packed_codes_all=self.k_codes_buffer[idx].view(-1, (normal_dim + 1) // 2),
+            scale_all=self.k_scale_buffer[idx].view(-1, 1),
+            outliers_all=self.k_outlier_buffer[idx].reshape(outlier_shape),
+            outlier_mask=layer.tq_outlier_mask,
+            R_T=layer.tq_R_T,
+            gather_indices=row_indices,
+            n_levels=n_levels,
+        )
+        v_flat = turboquant_decode_selected_packed4_triton(
+            packed_codes_all=self.v_codes_buffer[idx].view(-1, (normal_dim + 1) // 2),
+            scale_all=self.v_scale_buffer[idx].view(-1, 1),
+            outliers_all=self.v_outlier_buffer[idx].reshape(outlier_shape),
+            outlier_mask=layer.tq_outlier_mask,
+            R_T=layer.tq_R_T,
+            gather_indices=row_indices,
+            n_levels=n_levels,
+        )
+        self._k_workspace[:n_tokens].copy_(k_flat.view(n_tokens, self.head_num, self.head_dim))
+        self._v_workspace[:n_tokens].copy_(v_flat.view(n_tokens, self.head_num, self.head_dim))
+        self._last_layer_id = layer_id
+        self._last_active_version = self._active_version
+        self._last_decode_count = n_tokens
+        self._last_full_mode = False
+
+    def _decode_full(self, layer_id: int):
+        full_idx = torch.arange(self.total_slots, device=self.device, dtype=torch.long)
+        self._decode_selected(layer_id, full_idx)
+        self._last_full_mode = True
+
+    def _ensure_decoded(self, layer_id: int):
+        idx = layer_id - self.start_layer
+        if self.layer_ref[idx] is None:
+            raise RuntimeError(f"TurboQuant layer {layer_id} has not been initialized.")
+        if self._active_kv_indices is not None:
+            if (
+                self._last_layer_id == layer_id
+                and self._last_active_version == self._active_version
+                and not self._last_full_mode
+            ):
+                return self._last_decode_count
+            self._decode_selected(layer_id, self._active_kv_indices)
+            return self._last_decode_count
+
+        if self._last_layer_id == layer_id and self._last_full_mode:
+            return self._last_decode_count
+        self._decode_full(layer_id)
+        return self._last_decode_count
+
+    def _get_key_buffer(self, layer_id: int):
+        n = self._ensure_decoded(layer_id)
+        return self._k_workspace[:n]
+
+    def _get_value_buffer(self, layer_id: int):
+        n = self._ensure_decoded(layer_id)
+        return self._v_workspace[:n]
+
+    def get_kv_size_bytes(self):
+        k_size = 0
+        v_size = 0
+        for i in range(self.layer_num):
+            for buf in (
+                self.k_codes_buffer[i],
+                self.k_scale_buffer[i],
+                self.k_outlier_buffer[i],
+                self.k_qjl_bits_buffer[i],
+                self.k_qjl_norm_buffer[i],
+            ):
+                if buf is not None:
+                    k_size += get_tensor_size_bytes(buf)
+            for buf in (
+                self.v_codes_buffer[i],
+                self.v_scale_buffer[i],
+                self.v_outlier_buffer[i],
+                self.v_qjl_bits_buffer[i],
+                self.v_qjl_norm_buffer[i],
+            ):
+                if buf is not None:
+                    v_size += get_tensor_size_bytes(buf)
+        return k_size, v_size
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        tgt_loc = tgt_loc.to(dtype=torch.long, device=self.device)
+        src_loc = src_loc.to(dtype=torch.long, device=self.device)
+        for i in range(self.layer_num):
+            for buf in (
+                self.k_codes_buffer[i],
+                self.v_codes_buffer[i],
+                self.k_scale_buffer[i],
+                self.v_scale_buffer[i],
+                self.k_outlier_buffer[i],
+                self.v_outlier_buffer[i],
+                self.k_qjl_bits_buffer[i],
+                self.v_qjl_bits_buffer[i],
+                self.k_qjl_norm_buffer[i],
+                self.v_qjl_norm_buffer[i],
+            ):
+                if buf is not None:
+                    buf[tgt_loc] = buf[src_loc]
+            self.layer_write_version[i] += 1
+
+    def get_cpu_copy(self, indices):
+        torch.cuda.synchronize()
+        indices = indices.to(dtype=torch.long, device=self.device)
+        kv_cache_cpu = []
+        for i in range(self.layer_num):
+            layer_cpu = []
+            for buf in (
+                self.k_codes_buffer[i],
+                self.v_codes_buffer[i],
+                self.k_scale_buffer[i],
+                self.v_scale_buffer[i],
+                self.k_outlier_buffer[i],
+                self.v_outlier_buffer[i],
+                self.k_qjl_bits_buffer[i],
+                self.v_qjl_bits_buffer[i],
+                self.k_qjl_norm_buffer[i],
+                self.v_qjl_norm_buffer[i],
+            ):
+                layer_cpu.append(None if buf is None else buf[indices].to("cpu", non_blocking=True))
+            kv_cache_cpu.append(layer_cpu)
+        torch.cuda.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        torch.cuda.synchronize()
+        indices = indices.to(dtype=torch.long, device=self.device)
+        for i in range(self.layer_num):
+            layer_cpu = kv_cache_cpu[i]
+            for cpu_tensor, buf in zip(
+                layer_cpu,
+                (
+                    self.k_codes_buffer[i],
+                    self.v_codes_buffer[i],
+                    self.k_scale_buffer[i],
+                    self.v_scale_buffer[i],
+                    self.k_outlier_buffer[i],
+                    self.v_outlier_buffer[i],
+                    self.k_qjl_bits_buffer[i],
+                    self.v_qjl_bits_buffer[i],
+                    self.k_qjl_norm_buffer[i],
+                    self.v_qjl_norm_buffer[i],
+                ),
+            ):
+                if buf is not None and cpu_tensor is not None:
+                    buf[indices] = cpu_tensor.to(self.device, non_blocking=True)
+            self.layer_write_version[i] += 1
+        torch.cuda.synchronize()
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 

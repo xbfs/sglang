@@ -105,15 +105,26 @@ class WeightsMapper:
         }
 
 
-def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
-    return (
+def enable_fused_set_kv_buffer(
+    forward_batch: ForwardBatch, layer: Optional[RadixAttention] = None
+):
+    """Enable fused set_kv_buffer only on supported CUDA BF16 paths.
+
+    Fused set_kv_buffer currently does not support per-layer K/V scales.
+    """
+    base_enabled = (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     )
+    if not base_enabled:
+        return False
+
+    if layer is not None and (layer.k_scale is not None or layer.v_scale is not None):
+        return False
+    return True
 
 
 def create_fused_set_kv_buffer_arg(

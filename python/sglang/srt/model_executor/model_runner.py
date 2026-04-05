@@ -1849,20 +1849,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "turboquant":
-            # TurboQuant encode→decode round-trip: the cache stores dequantized
-            # values in the model's native dtype while the round-trip introduces
-            # controlled quantization noise.  The actual compression metadata
-            # (codebooks, rotation matrix, outlier mask) lives on each attention
-            # layer and is managed by TurboQuantKVCacheMethod.
+            # TurboQuant uses compressed KV storage in memory pool and dequantizes
+            # on-demand before attention computation.
             self.kv_cache_dtype = self.dtype
             self.turboquant_kv_cache = True
+            if not self.server_args.disable_cuda_graph:
+                logger.warning(
+                    "Disable CUDA graph because TurboQuant compressed KV path is enabled."
+                )
+                self.server_args.disable_cuda_graph = True
+            # if not self.server_args.disable_piecewise_cuda_graph:
+            #     logger.warning(
+            #         "Disable piecewise CUDA graph because TurboQuant compressed KV path is enabled."
+            #     )
+            #     self.server_args.disable_piecewise_cuda_graph = True
             self._apply_turboquant_to_layers()
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
+        if self.server_args.kv_cache_dtype == "turboquant":
+            log_info_on_rank0(logger, "Using KV cache dtype: turboquant-4bit")
+        else:
+            log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
     def _apply_turboquant_to_layers(self):
         """Apply TurboQuantConfig to all RadixAttention layers.
@@ -1877,7 +1887,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         from sglang.srt.layers.radix_attention import RadixAttention
 
-        tq_config = TurboQuantConfig()
+        # Storage-oriented default for kv-cache dtype turboquant:
+        # 4-bit codes, no outlier channels, and no QJL side buffers.
+        tq_config = TurboQuantConfig(bits=4.0, use_qjl=False, outlier_fraction=0.0)
         applied = 0
         for module in self.model.modules():
             if isinstance(module, RadixAttention):

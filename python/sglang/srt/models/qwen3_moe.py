@@ -637,7 +637,7 @@ class Qwen3MoeAttention(nn.Module):
                         layer=self.attn,
                         forward_batch=forward_batch,
                     )
-                    if enable_fused_set_kv_buffer(forward_batch)
+                    if enable_fused_set_kv_buffer(forward_batch, self.attn)
                     and self.compatible_with_fused_kv_buffer
                     else None
                 ),
@@ -678,7 +678,7 @@ class Qwen3MoeAttention(nn.Module):
 
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
-            enable_fused_set_kv_buffer(forward_batch)
+            enable_fused_set_kv_buffer(forward_batch, self.attn)
             and self.compatible_with_fused_kv_buffer
         )
         attn_output = self.attn(

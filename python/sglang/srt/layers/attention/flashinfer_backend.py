@@ -786,7 +786,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     k_store, v_store = k, v
-                    if is_turboquant_layer(layer):
+                    if is_turboquant_layer(layer) and not getattr(
+                        forward_batch.token_to_kv_pool, "is_turboquant_compressed_pool", False
+                    ):
                         k_store, v_store = apply_turboquant_kv_cache(layer, k, v)
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k_store, v_store, layer.k_scale, layer.v_scale
@@ -872,7 +874,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
             if save_kv_cache:
                 k_store, v_store = k, v
-                if is_turboquant_layer(layer):
+                if is_turboquant_layer(layer) and not getattr(
+                    forward_batch.token_to_kv_pool, "is_turboquant_compressed_pool", False
+                ):
                     k_store, v_store = apply_turboquant_kv_cache(layer, k, v)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k_store, v_store, layer.k_scale, layer.v_scale
@@ -903,7 +907,9 @@ class FlashInferAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 k_store, v_store = k, v
-                if is_turboquant_layer(layer):
+                if is_turboquant_layer(layer) and not getattr(
+                    forward_batch.token_to_kv_pool, "is_turboquant_compressed_pool", False
+                ):
                     k_store, v_store = apply_turboquant_kv_cache(layer, k, v)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k_store, v_store, layer.k_scale, layer.v_scale
@@ -1138,6 +1144,14 @@ class FlashInferIndicesUpdaterDecode:
                 self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     kv_indices[:kv_last_index]
                 )
+            )
+
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if getattr(token_to_kv_pool, "requires_local_kv_indices", False):
+            kv_last_index_i = int(kv_indptr[-1].item())
+            token_to_kv_pool.set_active_kv_indices(kv_indices[:kv_last_index_i])
+            kv_indices[:kv_last_index_i] = torch.arange(
+                kv_last_index_i, dtype=kv_indices.dtype, device=kv_indices.device
             )
 
         global global_override_indptr_cpu
@@ -1486,6 +1500,14 @@ class FlashInferIndicesUpdaterPrefill:
                 self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     kv_indices[:kv_last_index]
                 )
+            )
+
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if getattr(token_to_kv_pool, "requires_local_kv_indices", False):
+            kv_last_index_i = int(kv_indptr[-1].item())
+            token_to_kv_pool.set_active_kv_indices(kv_indices[:kv_last_index_i])
+            kv_indices[:kv_last_index_i] = torch.arange(
+                kv_last_index_i, dtype=kv_indices.dtype, device=kv_indices.device
             )
 
         # cached part

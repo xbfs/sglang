@@ -219,6 +219,167 @@ if HAS_TRITON:
             mask=mask,
         )
 
+    @triton.jit
+    def _turboquant_decode_gather_kernel(
+        # Inputs
+        codes_ptr,
+        scale_ptr,
+        outlier_ptr,
+        outlier_mask_ptr,
+        R_T_ptr,
+        gather_idx_ptr,
+        # QJL inputs (ignored if has_qjl is False)
+        qjl_bits_ptr,
+        qjl_norm_ptr,
+        # Output
+        output_ptr,
+        # Strides
+        stride_codes_row,
+        stride_outlier_row,
+        stride_RT_row,
+        stride_output_row,
+        stride_qjl_bits_row,
+        # Params
+        D: tl.constexpr,
+        n_normal: tl.constexpr,
+        n_outlier: tl.constexpr,
+        N_LEVELS: tl.constexpr,
+        has_qjl: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Gather source rows by indices + fused decode in one kernel."""
+        row_idx = tl.program_id(0)
+        src_row = tl.load(gather_idx_ptr + row_idx).to(tl.int32)
+
+        offs = tl.arange(0, BLOCK_D)
+        mask = offs < D
+
+        scale = tl.load(scale_ptr + src_row).to(tl.float32)
+        outlier_mask = tl.load(outlier_mask_ptr + offs, mask=mask, other=0).to(tl.int1)
+        normal_mask = ~outlier_mask & mask
+
+        normal_int = tl.where(normal_mask, 1, 0)
+        normal_cumsum = tl.cumsum(normal_int, axis=0) - 1
+        outlier_int = tl.where(outlier_mask & mask, 1, 0)
+        outlier_cumsum = tl.cumsum(outlier_int, axis=0) - 1
+
+        raw_codes = tl.load(
+            codes_ptr + src_row * stride_codes_row + normal_cumsum,
+            mask=normal_mask,
+            other=0,
+        ).to(tl.float32)
+        dequant_normal = (raw_codes / (N_LEVELS - 1) * 2.0 - 1.0) * scale
+
+        if has_qjl:
+            sign_raw = tl.load(
+                qjl_bits_ptr + src_row * stride_qjl_bits_row + normal_cumsum,
+                mask=normal_mask,
+                other=0,
+            ).to(tl.float32)
+            signs = sign_raw * 2.0 - 1.0
+            res_norm = tl.load(qjl_norm_ptr + src_row).to(tl.float32)
+            correction = signs * (res_norm * 1.2533141 / n_normal)
+            dequant_normal = dequant_normal + correction
+
+        outlier_vals = tl.load(
+            outlier_ptr + src_row * stride_outlier_row + outlier_cumsum,
+            mask=outlier_mask & mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        rotated = tl.zeros([BLOCK_D], dtype=tl.float32)
+        rotated = tl.where(normal_mask, dequant_normal, rotated)
+        rotated = tl.where(outlier_mask & mask, outlier_vals, rotated)
+
+        rotated_2d = tl.reshape(rotated, [1, BLOCK_D])
+        R_T_offs = offs[:, None] * stride_RT_row + offs[None, :]
+        R_T_mask = (offs[:, None] < D) & (offs[None, :] < D)
+        R_T_block = tl.load(R_T_ptr + R_T_offs, mask=R_T_mask, other=0.0).to(
+            tl.float32
+        )
+        out_2d = tl.dot(rotated_2d, R_T_block)
+        out = tl.reshape(out_2d, [BLOCK_D])
+        tl.store(
+            output_ptr + row_idx * stride_output_row + offs,
+            out.to(tl.float16),
+            mask=mask,
+        )
+
+    @triton.jit
+    def _turboquant_decode_gather_packed4_kernel(
+        # Inputs
+        packed_codes_ptr,
+        scale_ptr,
+        outlier_ptr,
+        outlier_mask_ptr,
+        R_T_ptr,
+        gather_idx_ptr,
+        # Output
+        output_ptr,
+        # Strides
+        stride_codes_row,
+        stride_outlier_row,
+        stride_RT_row,
+        stride_output_row,
+        # Params
+        D: tl.constexpr,
+        n_normal: tl.constexpr,
+        n_outlier: tl.constexpr,
+        N_LEVELS: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fused gather+decode for 4-bit packed codes (2 values/byte)."""
+        row_idx = tl.program_id(0)
+        src_row = tl.load(gather_idx_ptr + row_idx).to(tl.int32)
+        offs = tl.arange(0, BLOCK_D)
+        mask = offs < D
+
+        scale = tl.load(scale_ptr + src_row).to(tl.float32)
+        outlier_mask = tl.load(outlier_mask_ptr + offs, mask=mask, other=0).to(tl.int1)
+        normal_mask = ~outlier_mask & mask
+
+        normal_int = tl.where(normal_mask, 1, 0)
+        normal_cumsum = tl.cumsum(normal_int, axis=0) - 1
+        outlier_int = tl.where(outlier_mask & mask, 1, 0)
+        outlier_cumsum = tl.cumsum(outlier_int, axis=0) - 1
+
+        packed_idx = normal_cumsum // 2
+        packed_byte = tl.load(
+            packed_codes_ptr + src_row * stride_codes_row + packed_idx,
+            mask=normal_mask,
+            other=0,
+        ).to(tl.uint8)
+
+        is_high = (normal_cumsum % 2) == 1
+        low_nibble = packed_byte & 0x0F
+        high_nibble = (packed_byte >> 4) & 0x0F
+        codes_u8 = tl.where(is_high, high_nibble, low_nibble).to(tl.float32)
+        dequant_normal = (codes_u8 / (N_LEVELS - 1) * 2.0 - 1.0) * scale
+
+        outlier_vals = tl.load(
+            outlier_ptr + src_row * stride_outlier_row + outlier_cumsum,
+            mask=outlier_mask & mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        rotated = tl.zeros([BLOCK_D], dtype=tl.float32)
+        rotated = tl.where(normal_mask, dequant_normal, rotated)
+        rotated = tl.where(outlier_mask & mask, outlier_vals, rotated)
+
+        rotated_2d = tl.reshape(rotated, [1, BLOCK_D])
+        R_T_offs = offs[:, None] * stride_RT_row + offs[None, :]
+        R_T_mask = (offs[:, None] < D) & (offs[None, :] < D)
+        R_T_block = tl.load(R_T_ptr + R_T_offs, mask=R_T_mask, other=0.0).to(
+            tl.float32
+        )
+        out_2d = tl.dot(rotated_2d, R_T_block)
+        out = tl.reshape(out_2d, [BLOCK_D])
+        tl.store(
+            output_ptr + row_idx * stride_output_row + offs,
+            out.to(tl.float16),
+            mask=mask,
+        )
+
 
 def turboquant_encode_triton(
     k: torch.Tensor,
@@ -390,3 +551,154 @@ def turboquant_decode_triton(
         results.append(output.reshape(*batch_shape, D))
 
     return results[0], results[1]
+
+
+def turboquant_decode_selected_triton(
+    codes_all: torch.Tensor,
+    scale_all: torch.Tensor,
+    outliers_all: torch.Tensor,
+    outlier_mask: torch.Tensor,
+    R_T: torch.Tensor,
+    gather_indices: torch.Tensor,
+    n_levels: int,
+    use_qjl: bool = False,
+    qjl_bits_all: Optional[torch.Tensor] = None,
+    qjl_norm_all: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Decode selected rows with a fused gather+decode kernel."""
+    if gather_indices.numel() == 0:
+        return torch.empty((0, outlier_mask.shape[0]), dtype=torch.float16, device=codes_all.device)
+
+    if not HAS_TRITON:
+        indices = gather_indices.long()
+        codes = codes_all[indices].float()
+        scale = scale_all[indices].float()
+        outliers = outliers_all[indices].float()
+        normal_mask = ~outlier_mask
+        n_normal = int(normal_mask.sum().item())
+        recon = (codes / (n_levels - 1) * 2.0 - 1.0) * scale
+        if use_qjl and qjl_bits_all is not None and qjl_norm_all is not None:
+            signs = qjl_bits_all[indices].float() * 2.0 - 1.0
+            recon = recon + signs * (qjl_norm_all[indices].float() * 1.2533141 / n_normal)
+        d = outlier_mask.shape[0]
+        out = torch.zeros((indices.numel(), d), dtype=torch.float32, device=codes_all.device)
+        out[:, normal_mask] = recon
+        out[:, outlier_mask] = outliers
+        return (out @ R_T.float()).to(torch.float16)
+
+    D = outlier_mask.shape[0]
+    n_outlier = int(outlier_mask.sum().item())
+    n_normal = D - n_outlier
+    BLOCK_D = 1
+    while BLOCK_D < D:
+        BLOCK_D *= 2
+
+    codes_2d = codes_all.contiguous()
+    scale_1d = scale_all.reshape(-1).contiguous()
+    outliers_2d = outliers_all.contiguous()
+    gather_idx = gather_indices.to(device=codes_all.device).contiguous()
+    om = outlier_mask.to(codes_all.device).contiguous()
+    R_T_cont = R_T.float().contiguous()
+    output = torch.empty((gather_idx.numel(), D), dtype=torch.float16, device=codes_all.device)
+
+    has_qjl = use_qjl and qjl_bits_all is not None and qjl_norm_all is not None
+    if has_qjl:
+        qjl_bits = qjl_bits_all.contiguous()
+        qjl_norm = qjl_norm_all.reshape(-1).contiguous()
+        stride_qjl_bits_row = qjl_bits.stride(0)
+    else:
+        qjl_bits = codes_2d
+        qjl_norm = scale_1d
+        stride_qjl_bits_row = 0
+
+    _turboquant_decode_gather_kernel[(gather_idx.numel(),)](
+        codes_2d,
+        scale_1d,
+        outliers_2d,
+        om,
+        R_T_cont,
+        gather_idx,
+        qjl_bits,
+        qjl_norm,
+        output,
+        codes_2d.stride(0),
+        outliers_2d.stride(0),
+        R_T_cont.stride(0),
+        output.stride(0),
+        stride_qjl_bits_row,
+        D=D,
+        n_normal=n_normal,
+        n_outlier=n_outlier,
+        N_LEVELS=n_levels,
+        has_qjl=has_qjl,
+        BLOCK_D=BLOCK_D,
+    )
+    return output
+
+
+def turboquant_decode_selected_packed4_triton(
+    packed_codes_all: torch.Tensor,
+    scale_all: torch.Tensor,
+    outliers_all: torch.Tensor,
+    outlier_mask: torch.Tensor,
+    R_T: torch.Tensor,
+    gather_indices: torch.Tensor,
+    n_levels: int,
+) -> torch.Tensor:
+    """Decode selected rows for 4-bit packed codes with fused gather kernel."""
+    if gather_indices.numel() == 0:
+        return torch.empty((0, outlier_mask.shape[0]), dtype=torch.float16, device=packed_codes_all.device)
+
+    d = outlier_mask.shape[0]
+    n_outlier = int(outlier_mask.sum().item())
+    n_normal = d - n_outlier
+    if n_levels > 16:
+        raise ValueError(f"packed4 decode only supports n_levels <= 16, got {n_levels}")
+
+    if not HAS_TRITON:
+        indices = gather_indices.long()
+        packed = packed_codes_all[indices]
+        out = torch.empty((*packed.shape[:-1], n_normal), dtype=torch.uint8, device=packed.device)
+        out[..., 0::2] = packed & 0x0F
+        out[..., 1::2] = (packed >> 4) & 0x0F
+        codes = out[..., :n_normal].float()
+        scale = scale_all[indices].float()
+        recon = (codes / (n_levels - 1) * 2.0 - 1.0) * scale
+        outliers = outliers_all[indices].float()
+        full = torch.zeros((indices.numel(), d), dtype=torch.float32, device=packed.device)
+        normal_mask = ~outlier_mask
+        full[:, normal_mask] = recon
+        full[:, outlier_mask] = outliers
+        return (full @ R_T.float()).to(torch.float16)
+
+    BLOCK_D = 1
+    while BLOCK_D < d:
+        BLOCK_D *= 2
+
+    packed_codes = packed_codes_all.contiguous()
+    scale_1d = scale_all.reshape(-1).contiguous()
+    outliers_2d = outliers_all.contiguous()
+    gather_idx = gather_indices.to(device=packed_codes_all.device).contiguous()
+    om = outlier_mask.to(packed_codes_all.device).contiguous()
+    R_T_cont = R_T.float().contiguous()
+    output = torch.empty((gather_idx.numel(), d), dtype=torch.float16, device=packed_codes_all.device)
+
+    _turboquant_decode_gather_packed4_kernel[(gather_idx.numel(),)](
+        packed_codes,
+        scale_1d,
+        outliers_2d,
+        om,
+        R_T_cont,
+        gather_idx,
+        output,
+        packed_codes.stride(0),
+        outliers_2d.stride(0),
+        R_T_cont.stride(0),
+        output.stride(0),
+        D=d,
+        n_normal=n_normal,
+        n_outlier=n_outlier,
+        N_LEVELS=n_levels,
+        BLOCK_D=BLOCK_D,
+    )
+    return output
